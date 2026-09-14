@@ -292,6 +292,59 @@ class VisionMessagePrepMixin:
 
         return changed
 
+    def _try_promote_image_parts_to_user_message(
+        self, api_messages: list, *, remember_model: bool = True
+    ) -> bool:
+        """Move image parts out of tool messages into a following user message; True if any moved.
+
+        Preferred over ``_try_strip_image_parts_from_tool_messages`` for providers that accept images in
+        USER messages but reject list-type tool content (Hyper Charm ``unsupported input item type``,
+        Command Code ``Invalid input, param: messages.N.``). The image is PRESERVED rather than discarded:
+        the tool message keeps its text, and the images ride in a new user turn — the one shape every
+        provider tested accepts. Callers should fall back to the strip path when this returns False.
+
+        Records (provider, model) in ``_no_list_tool_content_models`` like the strip path, so later
+        results promote without a round-trip.
+        """
+        if not isinstance(api_messages, list):
+            return False
+
+        if remember_model:
+            key = _provider_model_key(self)
+            if not hasattr(self, "_no_list_tool_content_models"):
+                self._no_list_tool_content_models = set()
+            if key[1]:  # only record when we actually have a model id
+                self._no_list_tool_content_models.add(key)
+
+        promoted: List[Any] = []
+        changed = False
+        for msg in api_messages:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content")
+            # List content without image parts is left alone; there is nothing to promote.
+            if not self._content_has_image_parts(content):
+                continue
+
+            promoted.extend(part for part in content if _is_image_part(part))
+            # Tool message keeps its text; the image(s) move to the user turn appended below.
+            msg["content"] = "\n\n".join(_salvage_text_parts(content, any_dict_text=False)) or (
+                "[image moved to the following user message — this provider rejects "
+                "images inside tool results]"
+            )
+            changed = True
+
+        if promoted:
+            api_messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Image(s) returned by the preceding tool call:"},
+                    *promoted,
+                ],
+            })
+
+        return changed
+
     def _anthropic_preserve_dots(self) -> bool:
         """True for anthropic-compatible endpoints that keep dots in model names (DashScope, MiniMax, Xiaomi
         MiMo, OpenCode Go/Zen, ZAI/Zhipu; Bedrock's dotted inference-profile IDs 400 on the hyphenated form).
