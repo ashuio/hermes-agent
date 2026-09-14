@@ -188,6 +188,11 @@ _MULTIMODAL_TOOL_CONTENT_PATTERNS = (
     "tool message must be a string", "expected string, got list", "expected string, got array",
     # Console Go / pydantic-v2 relays behind opencode-go (422, param ``messages.N.tool.content.str``, #104731).
     "tool_call.content must be string", "tool.content.str", "input should be a valid string",
+    # TARS-PATCH: Hyper Charm (hyper.charm.land) Responses API rejects tool-result image items
+    # outright — 400 {"message":"unsupported input item type: "} (empty type name). Without this
+    # the multimodal recovery never fires, the walk exhausts, and the client sees a misleading
+    # replayed 402 "out of credits" from the last key instead of the real body-shape error.
+    "unsupported input item type",
 )
 
 # Local-inference memory/resource-ceiling rejections (oMLX/MLX memory guard,
