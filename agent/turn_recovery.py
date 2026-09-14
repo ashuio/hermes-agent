@@ -518,6 +518,12 @@ def recover_after_classification(
         and not _retry.multimodal_tool_content_retry_attempted
     ):
         _retry.multimodal_tool_content_retry_attempted = True
+        # TARS-PATCH: prefer PROMOTING the image into a user message (the one shape every provider
+        # tested accepts) over discarding it. Fall back to the original strip behaviour so providers
+        # that reject images everywhere still degrade gracefully.
+        if agent._try_promote_image_parts_to_user_message(api_messages):
+            _vlines(agent, "📐 Provider rejected images in tool results — moved them to a user message and retrying...")
+            return True, recovered_with_pool
         if agent._try_strip_image_parts_from_tool_messages(api_messages):
             _vlines(agent, "📐 Provider rejected list-type tool content — downgraded screenshots to text and retrying...")
             return True, recovered_with_pool
