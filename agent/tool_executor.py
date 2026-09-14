@@ -1032,6 +1032,49 @@ def _commit_tool_result(
     _tool_content = agent._tool_result_content_for_active_model(function_name, persisted_result)
     tool_message = make_tool_result_message(function_name, _tool_content, tool_call_id, effect_disposition=effect_disposition)
     messages.append(tool_message)
+    # TARS-PATCH: proactive promotion for providers that SILENTLY strip tool-role images
+    # (Bifrost: HTTP 200, image gone — no 400 ever fires, so the reactive recovery in
+    # turn_recovery.py never triggers). When the active model is vision-capable and the
+    # provider is known to strip tool images, move the image into a user message NOW.
+    # NOTE: agent.provider is the CANONICALIZED name ('custom') — the profile lookup must
+    # use requested_provider (the pre-canonicalization name, e.g. 'custom:bifrost') or the
+    # veto on the bifrost profile is invisible.
+    try:
+        _strips_tool_images = False
+        # TARS-PATCH: resolve the veto by base_url when the provider name is canonicalized.
+        # agent.provider AND agent.requested_provider are both canonicalized to 'custom' for
+        # named custom routes (custom:bifrost -> custom), so the profile lookup by name misses
+        # the veto registered under 'custom:bifrost'. The base_url is stable and unique —
+        # match it against custom_providers entries whose NAME resolves to a veto profile.
+        _prov_names = [str(x) for x in (getattr(agent, "requested_provider", ""), getattr(agent, "provider", "")) if x]
+        _base_url = (getattr(agent, "base_url", "") or "").strip().rstrip("/")
+        try:
+            from hermes_cli.config import load_config as _lc
+            _cp_entries = _lc().get("custom_providers", []) or []
+            for _entry in _cp_entries:
+                _entry_url = str(_entry.get("base_url", "") or "").strip().rstrip("/")
+                _entry_name = str(_entry.get("name", "") or "")
+                if _base_url and _entry_url and _entry_url == _base_url and _entry_name:
+                    _prov_names.append(f"custom:{_entry_name.lower()}")
+        except Exception:
+            pass
+        for _prov in _prov_names:
+            if not _prov:
+                continue
+            from providers import get_provider_profile as _gpp
+            _profile = _gpp(_prov)
+            if _profile is not None and getattr(_profile, "supports_vision_tool_messages", True) is False:
+                _strips_tool_images = True
+                break
+        if (_is_multimodal_tool_result(persisted_result)
+                and _strips_tool_images
+                and agent._model_supports_vision()
+                and function_name not in ("computer_use",)):
+            _moved = agent._try_promote_image_parts_to_user_message(messages, remember_model=False)
+            if _moved:
+                logging.info("Tool %s: provider strips tool-role images — promoted image parts to a user message", function_name)
+    except Exception:
+        logging.debug("proactive image promotion failed for %s", function_name, exc_info=True)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
         return None
 
