@@ -16,8 +16,8 @@ from tools.mcp_tool_common import _exc_str, _sanitize_error, mcp_field, _core
 from tools import mcp_tool_loop as _loop
 from tools.mcp_tool_content import (
     _MCP_HARD_RESULT_CAP_CHARS, _cache_mcp_audio_block, _cache_mcp_image_block,
-    _render_mcp_dropped_block_notice, _render_mcp_resource_block, _strip_reserved_meta_keys,
-    _truncate_mcp_text_result)
+    _mcp_image_part, _render_mcp_dropped_block_notice, _render_mcp_resource_block,
+    _strip_reserved_meta_keys, _truncate_mcp_text_result)
 from tools.mcp_tool_errors import _is_auth_error, _is_session_expired_error
 
 logger = logging.getLogger("tools.mcp_tool")
@@ -379,13 +379,16 @@ def _error_result_text(result) -> str:
     return "".join(str(t) for t in texts if t)
 
 
-def _render_content_blocks(result, server_name: str) -> Tuple[str, int]:
+def _render_content_blocks(result, server_name: str) -> Tuple[str, int, List[Dict[str, Any]]]:
     """Text passes through; image/audio blocks are cached (MEDIA: tags); resource blocks are
     materialized rather than silently dropped; unsupported blocks become an inline drop notice
-    (kimi-code#3227). Returns ``(text, usable_parts)`` — the count of REAL rendered blocks
-    (whitespace-only text and drop notices excluded) that the structuredContent arbitration uses."""
+    (kimi-code#3227). Returns ``(text, usable_parts, image_parts)`` — the count of REAL rendered
+    blocks (whitespace-only text and drop notices excluded) that the structuredContent arbitration
+    uses, plus the native ``image_url`` parts for any image blocks (TARS-PATCH: the MEDIA tag alone
+    never reaches native vision context, so the caller builds a multimodal envelope from these)."""
     parts: List[str] = []
     usable_parts = 0
+    image_parts: List[Dict[str, Any]] = []
     # MCP tool results can also include ImageContent blocks (screenshot / Blockbench / Playwright etc.);
     # cache those via the gateway's image-cache helper so they flow through Hermes' MEDIA: tag convention
     # and out to messaging adapters that render images natively. Without this, image blocks were silently
@@ -398,6 +401,11 @@ def _render_content_blocks(result, server_name: str) -> Tuple[str, int]:
             if block.text.strip():
                 usable_parts += 1
             continue
+        # TARS-PATCH: collect the native image part BEFORE the MEDIA-tag fallback chain, so an image
+        # block yields both the outbound tag and a real vision part.
+        part = _mcp_image_part(block)
+        if part is not None:
+            image_parts.append(part)
         rendered = _cache_mcp_image_block(block) or _cache_mcp_audio_block(block) or _render_mcp_resource_block(block, server_name)
         if rendered:
             parts.append(rendered)
@@ -412,7 +420,7 @@ def _render_content_blocks(result, server_name: str) -> Tuple[str, int]:
             # believing the tool returned less than it did, with no way to recover.
             parts.append(_render_mcp_dropped_block_notice(block, block_type))
     # Hard-cap pathological payloads; ordinary large results pass to spillover.
-    return _truncate_mcp_text_result("\n".join(parts)), usable_parts
+    return _truncate_mcp_text_result("\n".join(parts)), usable_parts, image_parts
 
 
 def _capped_structured_content(result):
@@ -443,20 +451,40 @@ def _capped_structured_content(result):
     return _truncate_mcp_text_result(as_json) if len(as_json) > _MCP_HARD_RESULT_CAP_CHARS else structured
 
 
-def _render_call_tool_result(result, server_name: str) -> str:
-    """Pure: ``CallToolResult`` -> handler JSON. ``content`` and ``structuredContent`` are
+def _render_call_tool_result(result, server_name: str):
+    """Pure: ``CallToolResult`` -> handler JSON (or a multimodal envelope when image blocks are
+    present). ``content`` and ``structuredContent`` are
     ALTERNATIVES, never both forwarded (kimi-code#3234): spec-following servers already render
     their data into content, so forwarding both sent it twice. content wins whenever it rendered
     anything usable (no richness heuristic is attempted — none is reliable); structuredContent
     fills in only when the blocks rendered effectively empty, keeping structuredContent-only
-    servers working. ``_meta`` minus reserved keys is always surfaced."""
+    servers working. ``_meta`` minus reserved keys is always surfaced.
+
+    TARS-PATCH: when the result carried image blocks, return the ``_multimodal`` envelope the
+    registry accepts (``tools/registry.py::_normalize_handler_result``) so the pixels reach native
+    vision context. The MEDIA: tag stays in the text part, so outbound delivery is unchanged."""
     if mcp_field(result, "is_error", "isError", False):
         return tool_error(_sanitize_error(_truncate_mcp_text_result(_error_result_text(result) or "MCP tool returned an error")))
-    text_result, usable_parts = _render_content_blocks(result, server_name)
+    text_result, usable_parts, image_parts = _render_content_blocks(result, server_name)
     structured = _capped_structured_content(result)
     meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
     if structured is not None and usable_parts > 0:
         structured = None  # drop notices do not count as usable content
+    if image_parts:
+        # TARS-PATCH: images present — hand back a multimodal envelope. Text keeps the MEDIA: tag
+        # (and any structured/_meta summary) so nothing that worked before stops working.
+        text_summary = text_result or "MCP tool returned image content."
+        if structured is not None:
+            try:
+                text_summary = f"{text_summary}\n\n{json.dumps(structured, ensure_ascii=False)}"
+            except (TypeError, ValueError):
+                pass
+        return {
+            "_multimodal": True,
+            "content": [{"type": "text", "text": text_summary}, *image_parts],
+            "text_summary": text_summary,
+            "meta": {"mcp_server": server_name, "image_count": len(image_parts), "native_vision": True},
+        }
     if structured is None and meta is None:
         return json.dumps({"result": text_result}, ensure_ascii=False)
     # Key order is part of the output: "result" leads when there is text, otherwise "_meta" precedes it.
@@ -476,10 +504,12 @@ def _render_call_tool_result(result, server_name: str) -> str:
 
 
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
-    """Sync registry handler (``handler(args_dict, **kwargs) -> str``) calling an MCP tool via the background loop."""
+    """Sync registry handler (``handler(args_dict, **kwargs) -> str | dict``) calling an MCP tool via
+    the background loop. Returns a JSON string, or a ``_multimodal`` envelope when the result carried
+    image blocks (TARS-PATCH) — the registry accepts both."""
     op = f"tools/call {tool_name}"
 
-    def _handler(args: dict, **kwargs) -> str:
+    def _handler(args: dict, **kwargs) -> "str | dict":
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:

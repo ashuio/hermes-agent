@@ -125,6 +125,23 @@ def _cache_mcp_image_block(block) -> str:
     return _cache_mcp_media_block(block, "image", "cache_image_from_bytes", _mcp_image_extension_for_mime_type)
 
 
+def _mcp_image_part(block) -> Optional[Dict[str, Any]]:
+    """``image_url`` content part for an MCP ``ImageContent`` block, or None.
+
+    TARS-PATCH: the ``MEDIA:<path>`` tag alone only reaches OUTBOUND messaging adapters — it never
+    enters native vision context (``agent/image_routing.py`` has no MEDIA handling at all). Emitting
+    a real image part lets the tool result carry pixels, which the multimodal-tool-content recovery
+    can then promote into a user message for providers that reject images inside tool results
+    (Hyper Charm, Command Code). The MEDIA tag is kept alongside this so outbound delivery does not
+    regress.
+    """
+    data = getattr(block, "data", None)
+    mime = _base_mime(mcp_field(block, "mime_type", "mimeType"))
+    if not data or not mime.startswith("image/"):
+        return None
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+
+
 def _cache_mcp_audio_block(block) -> str:
     """Cache an ``AudioContent`` block and return a ``MEDIA:<path>`` tag ("" on any failure)."""
     return _cache_mcp_media_block(
