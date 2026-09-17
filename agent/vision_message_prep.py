@@ -57,6 +57,39 @@ def _provider_model_key(agent: Any) -> tuple[str, str]:
     )
 
 
+def _agent_needs_promotion(agent: Any) -> bool:
+    """TARS-PATCH: True when tool-result images for this route should be kept for the
+    executor to PROMOTE into a user message instead of being summarised/discarded.
+
+    Two sources, both conservative:
+    - the session's promote set (recorded by reactive recovery after a real promotion);
+    - the unified resolver for operator-configured custom endpoints — the one route
+      family where "rejects tool images" is handled by promotion end-to-end. Third-party
+      profiles return False here and keep the upstream downgrade path.
+
+    Module-level (like ``_provider_model_key``) so ``MagicMock(spec=AIAgent)`` agents in
+    tests don't swallow it — method calls on spec'd mocks return truthy MagicMocks.
+    """
+    try:
+        key = _provider_model_key(agent)
+        if key[1] and key in (getattr(agent, "_promote_tool_content_models", None) or ()):
+            return True
+        from agent.vision_tool_veto import is_custom_endpoint_route, resolve_tool_result_image_veto
+
+        provider = getattr(agent, "provider", "")
+        base_url = getattr(agent, "base_url", "")
+        if not is_custom_endpoint_route(provider, base_url=base_url):
+            return False
+        return resolve_tool_result_image_veto(
+            provider,
+            getattr(agent, "model", ""),
+            requested_provider=getattr(agent, "requested_provider", ""),
+            base_url=base_url,
+        )
+    except Exception:
+        return False
+
+
 class VisionMessagePrepMixin:
     """Vision probes + image-part fallbacks for outgoing messages (see module docstring)."""
 
@@ -215,6 +248,22 @@ class VisionMessagePrepMixin:
             return content
 
         if self._model_supports_vision():
+            key = _provider_model_key(self)
+            if key in (getattr(self, "_no_list_tool_content_models", None) or ()):
+                logger.debug(
+                    "Tool %s: model %s/%s known to reject list-type tool "
+                    "content this session — sending text summary",
+                    tool_name, key[0], key[1],
+                )
+                return _multimodal_text_summary(result)
+            # TARS-PATCH (promote-over-discard): custom-endpoint routes that reject images in
+            # TOOL results keep them here — the executor promotes them into a user message
+            # before the provider sees the request, so nothing is lost. A summary at this
+            # point would discard the image before promotion gets a chance to run. Applies to
+            # the operator's own routes only; third-party profiles (xiaomi, opencode-zen,
+            # routing aggregators) keep the upstream downgrade semantics below.
+            if tool_name != "computer_use" and _agent_needs_promotion(self):
+                return content
             # Vision on paper, but the provider rejects list-type tool content (or we already learned that
             # in-session): short-circuit to a text summary.
             if not self._provider_supports_vision_tool_messages():
@@ -222,14 +271,6 @@ class VisionMessagePrepMixin:
                     "Tool %s: provider %s does not accept list-type tool "
                     "content — sending text summary",
                     tool_name, getattr(self, "provider", ""),
-                )
-                return _multimodal_text_summary(result)
-            key = _provider_model_key(self)
-            if key in (getattr(self, "_no_list_tool_content_models", None) or ()):
-                logger.debug(
-                    "Tool %s: model %s/%s known to reject list-type tool "
-                    "content this session — sending text summary",
-                    tool_name, key[0], key[1],
                 )
                 return _multimodal_text_summary(result)
             return content

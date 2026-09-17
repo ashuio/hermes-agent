@@ -462,14 +462,21 @@ def _should_use_native_vision_fast_path() -> bool:
         cfg = load_config()
         if decide_image_input_mode(provider, model, cfg) != "native":
             return False
-        # The profile veto applies ahead of the capability lookup too: a
-        # model marked vision-capable by models.dev / custom_providers must
-        # not re-open the multimodal-envelope route the profile rejects.
-        if _profile_rejects_tool_media(provider, model):
-            return False
-        return (
-            _supports_media_in_tool_results(provider, model)
-            or _lookup_supports_vision(provider, model, cfg) is True)
+        if _supports_media_in_tool_results(provider, model):
+            return True
+        if _lookup_supports_vision(provider, model, cfg) is True:
+            # TARS-PATCH (promote-over-discard): the profile veto means the provider rejects
+            # images inside TOOL results — but operator-configured custom endpoints still get
+            # native pixels: the executor PROMOTES the image into a user message before the
+            # provider ever sees the request (agent/tool_executor.py, agent/vision_tool_veto.py).
+            # Third-party profiles (xiaomi, opencode-zen, routing aggregators) keep the
+            # conservative bail — promotion is not guaranteed for routes we don't own (#89981).
+            if _profile_rejects_tool_media(provider, model):
+                from agent.vision_tool_veto import is_custom_endpoint_route
+                if not is_custom_endpoint_route(provider):
+                    return False
+            return True
+        return False
     except Exception as exc:
         logger.debug("Native vision fast-path check failed: %s", exc)
         return False
