@@ -304,18 +304,20 @@ class VisionMessagePrepMixin:
         the tool message keeps its text, and the images ride in a new user turn — the one shape every
         provider tested accepts. Callers should fall back to the strip path when this returns False.
 
-        Records (provider, model) in ``_no_list_tool_content_models`` like the strip path, so later
-        results promote without a round-trip.
+        Records (provider, model) in ``_promote_tool_content_models`` — deliberately NOT the strip
+        set (``_no_list_tool_content_models``), whose reader downgrades content to a text summary
+        and would lose the image. The executor consults this set to promote later results
+        pre-emptively, so a route that needed one reactive promotion gets no further round-trips.
         """
         if not isinstance(api_messages, list):
             return False
 
         if remember_model:
             key = _provider_model_key(self)
-            if not hasattr(self, "_no_list_tool_content_models"):
-                self._no_list_tool_content_models = set()
+            if not hasattr(self, "_promote_tool_content_models"):
+                self._promote_tool_content_models = set()
             if key[1]:  # only record when we actually have a model id
-                self._no_list_tool_content_models.add(key)
+                self._promote_tool_content_models.add(key)
 
         promoted: List[Any] = []
         changed = False
