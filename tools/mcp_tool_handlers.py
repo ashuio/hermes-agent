@@ -510,18 +510,27 @@ def _render_call_tool_result(result, server_name: str):
         structured = None  # drop notices do not count as usable content
     if image_parts:
         # TARS-PATCH: images present — hand back a multimodal envelope. Text keeps the MEDIA: tag
-        # (and any structured/_meta summary) so nothing that worked before stops working.
+        # (and any structured summary) so nothing that worked before stops working. The stripped
+        # user _meta rides under "mcp_meta": the non-image JSON path surfaces it, and dropping it
+        # only because images are present would lose data (F4).
         text_summary = text_result or "MCP tool returned image content."
         if structured is not None:
             try:
                 text_summary = f"{text_summary}\n\n{json.dumps(structured, ensure_ascii=False)}"
             except (TypeError, ValueError):
                 pass
+        envelope_meta: Dict[str, Any] = {
+            "mcp_server": server_name,
+            "image_count": len(image_parts),
+            "native_vision": True,
+        }
+        if meta:
+            envelope_meta["mcp_meta"] = meta
         return {
             "_multimodal": True,
             "content": [{"type": "text", "text": text_summary}, *image_parts],
             "text_summary": text_summary,
-            "meta": {"mcp_server": server_name, "image_count": len(image_parts), "native_vision": True},
+            "meta": envelope_meta,
         }
     if structured is None and meta is None:
         return json.dumps({"result": text_result}, ensure_ascii=False)
